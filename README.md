@@ -1,4 +1,4 @@
-# WooCommerce Abandoned Cart to Webhook
+# WooCommerce Abandoned Cart to Make
 
 A WordPress plugin for WooCommerce that detects and records abandoned carts, captures contact details, and sends all data to Make (Integromat) via webhook for follow-up workflows. Includes an admin dashboard for analytics and management.
 
@@ -37,9 +37,12 @@ A WordPress plugin for WooCommerce that detects and records abandoned carts, cap
   ],
   "cart_total": "99.99",
   "abandonment_timestamp": "2025-06-30 12:34:56",
-  "cart_id": 1
+  "cart_id": 1,
+  "restore_url": "https://your-site.com/cart/?wc_cart_hash=SESSION_KEY"
 }
 ```
+
+- `restore_url`: A direct link for the customer to return and restore their cart. Include this in your Make scenario emails/SMS for a seamless recovery experience.
 
 ## Analytics
 - The admin dashboard provides a table of all abandoned carts with status and actions.
@@ -48,6 +51,11 @@ A WordPress plugin for WooCommerce that detects and records abandoned carts, cap
 ## Security & GDPR
 - Shows a notice: “If you don’t complete your purchase, we may contact you about your cart.”
 - Stores only essential contact information.
+- Allows data deletion from the admin panel.
+
+## Support
+For issues or feature requests, please open an issue on the plugin repository or contact the author.
+
 - Allows data deletion from the admin panel.
 
 ## Support
