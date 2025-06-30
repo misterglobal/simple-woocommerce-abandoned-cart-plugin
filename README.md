@@ -1,4 +1,4 @@
-# WooCommerce Abandoned Cart to Make
+# WooCommerce Abandoned Cart to Webhook
 
 A WordPress plugin for WooCommerce that detects and records abandoned carts, captures contact details, and sends all data to Make (Integromat) via webhook for follow-up workflows. Includes an admin dashboard for analytics and management.
 
