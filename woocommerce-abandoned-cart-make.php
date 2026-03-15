@@ -91,10 +91,17 @@ class WC_Abandoned_Cart_Make {
 
     // Admin page: Table of abandoned carts
     public function admin_page() {
+        // Capability check
+        if (!current_user_can('manage_woocommerce')) {
+            wp_die(__('You do not have sufficient permissions to access this page.'));
+        }
+        
         global $wpdb;
         $table = $wpdb->prefix . 'abandoned_carts';
-        // Handle actions
+        
+        // Handle actions with nonce verification and capability checks
         if (isset($_GET['resend']) && is_numeric($_GET['resend'])) {
+            check_admin_referer('resend_cart_' . intval($_GET['resend']));
             $id = intval($_GET['resend']);
             $cart = $wpdb->get_row($wpdb->prepare("SELECT * FROM $table WHERE id = %d", $id));
             if ($cart) {
@@ -104,6 +111,7 @@ class WC_Abandoned_Cart_Make {
             }
         }
         if (isset($_GET['recover']) && is_numeric($_GET['recover'])) {
+            check_admin_referer('recover_cart_' . intval($_GET['recover']));
             $id = intval($_GET['recover']);
             $wpdb->update($table, ['status' => 'recovered'], ['id' => $id]);
             echo '<div class="updated"><p>Cart ID ' . esc_html($id) . ' marked as recovered.</p></div>';
@@ -120,8 +128,8 @@ class WC_Abandoned_Cart_Make {
             echo '<td>' . esc_html($cart->created_at) . '</td>';
             echo '<td>' . ($cart->sent_to_make ? 'Yes' : 'No') . '</td>';
             echo '<td>';
-            echo '<a href="?page=wc-abandoned-carts&resend=' . intval($cart->id) . '" class="button">Resend to Make</a> ';
-            echo '<a href="?page=wc-abandoned-carts&recover=' . intval($cart->id) . '" class="button">Mark as Recovered</a>';
+            echo '<a href="?page=wc-abandoned-carts&resend=' . intval($cart->id) . '&_wpnonce=' . wp_create_nonce('resend_cart_' . intval($cart->id)) . '" class="button">Resend to Make</a> ';
+            echo '<a href="?page=wc-abandoned-carts&recover=' . intval($cart->id) . '&_wpnonce=' . wp_create_nonce('recover_cart_' . intval($cart->id)) . '" class="button">Mark as Recovered</a>';
             echo '</td>';
             echo '</tr>';
         }
@@ -132,6 +140,8 @@ class WC_Abandoned_Cart_Make {
     private function send_to_make($cart) {
         $webhook_url = get_option('wc_abandoned_cart_webhook_url', '');
         if (!$webhook_url) return;
+        
+        $enable_logging = get_option('wc_abandoned_cart_logging', 0);
         $payload = array(
             'email' => $cart->email,
             'name' => $cart->name,
@@ -146,7 +156,26 @@ class WC_Abandoned_Cart_Make {
             'headers' => array('Content-Type' => 'application/json'),
             'timeout' => 10
         );
-        wp_remote_post($webhook_url, $args);
+        $response = wp_remote_post($webhook_url, $args);
+        
+        // Log errors if logging is enabled
+        if (is_wp_error($response)) {
+            $error_message = $response->get_error_message();
+            if ($enable_logging) {
+                error_log('[WooCommerce Abandoned Cart] Webhook error for cart ' . $cart->id . ': ' . $error_message);
+            }
+            return false;
+        }
+        
+        $response_code = wp_remote_retrieve_response_code($response);
+        if ($response_code >= 400) {
+            if ($enable_logging) {
+                error_log('[WooCommerce Abandoned Cart] Webhook HTTP error for cart ' . $cart->id . ': HTTP ' . $response_code);
+            }
+            return false;
+        }
+        
+        return true;
     }
 
     // Settings page
@@ -242,11 +271,15 @@ class WC_Abandoned_Cart_Make {
     public function check_abandoned_carts() {
         $timeout = get_option('wc_abandoned_cart_timeout', 60); // minutes
         $webhook_url = get_option('wc_abandoned_cart_webhook_url', '');
+        $enable_logging = get_option('wc_abandoned_cart_logging', 0);
+        
         if (!$webhook_url) return;
+        
         global $wpdb;
         $table = $wpdb->prefix . 'abandoned_carts';
         $threshold = date('Y-m-d H:i:s', strtotime('-' . intval($timeout) . ' minutes'));
         $carts = $wpdb->get_results($wpdb->prepare("SELECT * FROM $table WHERE status = 'pending' AND created_at < %s AND sent_to_make = 0", $threshold));
+        
         foreach ($carts as $cart) {
             $payload = array(
                 'email' => $cart->email,
@@ -263,14 +296,30 @@ class WC_Abandoned_Cart_Make {
                 'timeout' => 10
             );
             $response = wp_remote_post($webhook_url, $args);
+            
             if (!is_wp_error($response)) {
-                $wpdb->update($table, ['sent_to_make' => 1], ['id' => $cart->id]);
+                $response_code = wp_remote_retrieve_response_code($response);
+                if ($response_code >= 400) {
+                    if ($enable_logging) {
+                        error_log('[WooCommerce Abandoned Cart] Cron webhook HTTP error for cart ' . $cart->id . ': HTTP ' . $response_code);
+                    }
+                } else {
+                    $wpdb->update($table, ['sent_to_make' => 1], ['id' => $cart->id]);
+                }
+            } else {
+                if ($enable_logging) {
+                    error_log('[WooCommerce Abandoned Cart] Cron webhook error for cart ' . $cart->id . ': ' . $response->get_error_message());
+                }
             }
         }
+        
         $expire_days = get_option('wc_abandoned_cart_expiry_days', 30);
         if ($expire_days > 0) {
             $expire_threshold = date('Y-m-d H:i:s', strtotime('-' . intval($expire_days) . ' days'));
-            $wpdb->update($table, ['status' => 'expired'], [ 'status' => 'pending', 'created_at <' => $expire_threshold ]);
+            $wpdb->query($wpdb->prepare(
+                "UPDATE $table SET status = 'expired' WHERE status = 'pending' AND created_at < %s",
+                $expire_threshold
+            ));
         }
     }
 
@@ -288,33 +337,80 @@ class WC_Abandoned_Cart_Make {
 
     // AJAX handler to save abandoned cart email to WooCommerce session
     public function ajax_save_abandoned_cart_email() {
+        // Verify nonce for security
+        if (!wp_verify_nonce($_POST['nonce'], 'save_abandoned_cart_email_nonce')) {
+            wp_send_json_error(['message' => 'Invalid nonce']);
+            return;
+        }
+        
         if (!empty($_POST['email']) && is_email($_POST['email'])) {
-            if (function_exists('WC')) {
+            if (function_exists('WC') && WC()->session) {
                 WC()->session->set('abandoned_cart_email', sanitize_email($_POST['email']));
+                WC()->session->set('abandoned_cart_phone', isset($_POST['phone']) ? sanitize_text_field($_POST['phone']) : '');
+                WC()->session->set('abandoned_cart_name', isset($_POST['name']) ? sanitize_text_field($_POST['name']) : '');
+                // Trigger cart tracking immediately after email is saved
+                $this->track_cart();
             }
             wp_send_json_success();
         }
-        wp_send_json_error();
+        wp_send_json_error(['message' => 'Invalid email']);
     }
 
-    // Update exit-intent popup JS to use AJAX
+    // Update exit-intent popup JS to use AJAX with better UX
     public function exit_intent_popup() {
+        // Only show for guest users (not logged in)
+        if (is_user_logged_in()) return;
+        
+        $nonce = wp_create_nonce('save_abandoned_cart_email_nonce');
         ?>
+        <div id="wc-ac-popup" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.5); z-index:9999;">
+            <div style="background:#fff; max-width:400px; margin:15% auto; padding:20px; border-radius:8px; position:relative;">
+                <h2 style="margin-top:0;">Save Your Cart?</h2>
+                <p>Enter your email and we'll notify you when you're ready to complete your purchase.</p>
+                <form id="wc-ac-popup-form">
+                    <p><input type="email" id="wc-ac-email" placeholder="your@email.com" required style="width:100%; padding:8px; margin-bottom:10px;"></p>
+                    <p><input type="text" id="wc-ac-name" placeholder="Your name (optional)" style="width:100%; padding:8px; margin-bottom:10px;"></p>
+                    <p><input type="tel" id="wc-ac-phone" placeholder="Phone (optional)" style="width:100%; padding:8px; margin-bottom:10px;"></p>
+                    <p style="display:flex; gap:10px;">
+                        <button type="submit" class="button button-primary">Save Cart</button>
+                        <button type="button" id="wc-ac-close" class="button">No Thanks</button>
+                    </p>
+                </form>
+            </div>
+        </div>
         <script>
-        let shown = false;
-        document.addEventListener('mouseout', function(e) {
-            if (!shown && e.clientY < 50) {
-                shown = true;
-                let email = prompt('Enter your email to save your cart:');
-                if (email) {
-                    fetch('<?php echo admin_url('admin-ajax.php'); ?>', {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-                        body: 'action=save_abandoned_cart_email&email=' + encodeURIComponent(email)
-                    });
+        (function() {
+            var popupShown = sessionStorage.getItem('wc_ac_popup_shown');
+            if (popupShown) return;
+            
+            document.addEventListener('mouseout', function(e) {
+                if (e.clientY < 50 && !popupShown) {
+                    popupShown = true;
+                    sessionStorage.setItem('wc_ac_popup_shown', '1');
+                    document.getElementById('wc-ac-popup').style.display = 'block';
                 }
-            }
-        });
+            });
+            
+            document.getElementById('wc-ac-close').addEventListener('click', function() {
+                document.getElementById('wc-ac-popup').style.display = 'none';
+            });
+            
+            document.getElementById('wc-ac-popup-form').addEventListener('submit', function(e) {
+                e.preventDefault();
+                var email = document.getElementById('wc-ac-email').value;
+                var name = document.getElementById('wc-ac-name').value;
+                var phone = document.getElementById('wc-ac-phone').value;
+                
+                fetch('<?php echo admin_url('admin-ajax.php'); ?>', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                    body: 'action=save_abandoned_cart_email&nonce=<?php echo $nonce; ?>&email=' + encodeURIComponent(email) + '&name=' + encodeURIComponent(name) + '&phone=' + encodeURIComponent(phone)
+                }).then(function() {
+                    document.getElementById('wc-ac-popup').style.display = 'none';
+                    alert('Cart saved! We\'ll remind you later.');
+                });
+            });
+        })();
         </script>
         <?php
     }
